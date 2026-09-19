@@ -1,8 +1,8 @@
 import sqlite3
 from datetime import datetime
 from typing import Optional
+from config import DB_PATH
 
-DB_PATH = "channel_posts.db"
 
 def init_db():
         conn = sqlite3.connect(DB_PATH)
