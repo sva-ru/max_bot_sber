@@ -1,5 +1,17 @@
+# --- Работа с MAX ---
 maxapi>=1.2.0
+
+# --- Планировщик публикаций ---
 apscheduler>=3.10.0
+
+# --- Парсинг RSS ---
 feedparser>=6.0.0
-python-dotenv>=1.0.0
+
+# --- HTTP-клиент (используется maxapi и check_rss.py) ---
 aiohttp>=3.9.0
+
+# --- Переменные окружения из .env ---
+python-dotenv>=1.0.0
+
+# --- GigaChat API ---
+gigachat>=0.2.0
