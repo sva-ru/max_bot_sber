@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).parent
+CONTENT_DIR = BASE_DIR / "content"
 
 # --- MAX ---
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")

@@ -1,14 +1,17 @@
-# content_generator.py
+# content_generator.py (начало файла)
+import json
 import logging
 import random
 import re
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional, Dict, List
 
 import feedparser
 
 from gigachat_client import generate_text_safe
 from url_utils import resolve_url
+from config import CONTENT_DIR
 
 logger = logging.getLogger(__name__)
 rejected = logging.getLogger("rss_rejected")
@@ -89,6 +92,60 @@ def extract_company_name(text: str) -> Optional[str]:
 def extract_urls(text: str) -> list:
     return URL_PATTERN.findall(text or "")
 
+# ================================================================
+# ЗАГРУЗКА КЕЙСОВ И АНАЛИТИКИ ИЗ JSON
+# ================================================================
+
+CASES_FILE = Path(CONTENT_DIR) / "cases.json"
+ANALYTICS_FILE = Path(CONTENT_DIR) / "analytics.json"
+
+
+def load_cases() -> List[Dict]:
+    """
+    Читает кейсы из content/cases.json.
+    Файл перечитывается при каждом вызове — правки видны без перезапуска.
+    """
+    if not CASES_FILE.exists():
+        logger.warning(f"Файл кейсов не найден: {CASES_FILE}")
+        return []
+    try:
+        with CASES_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            logger.error(f"cases.json должен содержать массив, а не {type(data)}")
+            return []
+        logger.debug(f"Загружено кейсов: {len(data)}")
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка JSON в cases.json: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка чтения cases.json: {e}")
+        return []
+
+
+def load_analytics() -> List[Dict]:
+    """
+    Читает аналитику из content/analytics.json.
+    Файл перечитывается при каждом вызове.
+    """
+    if not ANALYTICS_FILE.exists():
+        logger.warning(f"Файл аналитики не найден: {ANALYTICS_FILE}")
+        return []
+    try:
+        with ANALYTICS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            logger.error(f"analytics.json должен содержать массив, а не {type(data)}")
+            return []
+        logger.debug(f"Загружено аналитики: {len(data)}")
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка JSON в analytics.json: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка чтения analytics.json: {e}")
+        return []
 
 # ================================================================
 # ШАБЛОНЫ
@@ -130,15 +187,15 @@ TEMPLATES = {
     ),
 
     "analytics": (
-        "📈 **Аналитика для крупного и среднего бизнеса**\n\n"
-        "{content}\n\n"
-        "💼 **Практический вывод:**\n"
-        "{insight}\n\n"
-        "🔗 Источник:\n{source}\n\n"
-        "#Аналитика #БизнесЮга #СберЮЗБ #{industry_tag}"
+    "📈 **Аналитика для крупного и среднего бизнеса**\n\n"
+    "{content}\n\n"
+    "💼 **Практический вывод:**\n"
+    "{insight}\n\n"
+    "🔗 Источник: {source}\n"
+    "{source_url_line}\n"
+    "#Аналитика #БизнесЮга #СберЮЗБ #{industry_tag}"
     ),
 }
-
 
 # ================================================================
 # RSS СБОР С ФИЛЬТРАЦИЕЙ И ЛОГИРОВАНИЕМ
@@ -436,17 +493,18 @@ def generate_news_post(news_item: Dict) -> Optional[Dict]:
 # ================================================================
 
 def generate_case_post() -> Optional[Dict]:
-    if not CASES:
-        logger.warning("Список CASES пуст")
+    cases = load_cases()
+    if not cases:
+        logger.warning("Список кейсов пуст или файл не найден")
         return None
 
     today = date.today()
-    relevant = [c for c in CASES if c.get("year") == today.year]
-    dropped = len(CASES) - len(relevant)
+    relevant = [c for c in cases if c.get("year") == today.year]
+    dropped = len(cases) - len(relevant)
 
     if dropped > 0:
         logger.info(
-            f"Кейсы: всего {len(CASES)}, за {today.year} год — "
+            f"Кейсы: всего {len(cases)}, за {today.year} год — "
             f"{len(relevant)}, отброшено по году — {dropped}"
         )
 
@@ -456,10 +514,14 @@ def generate_case_post() -> Optional[Dict]:
 
     case = random.choice(relevant)
 
+    # Формируем блок «клиент» — только если есть публичный источник
+    src_url = case.get("source_url", "")
+    has_real_source = bool(src_url) and "пример-пресс-релиза" not in src_url
+
     client_block = ""
-    if case.get("client_name") and case.get("source_url"):
+    if case.get("client_name") and has_real_source:
         client_block += f"🏢 **Клиент:** {case['client_name']}\n"
-    if case.get("client_inn") and case.get("source_url"):
+    if case.get("client_inn") and has_real_source:
         client_block += f"🆔 **ИНН:** {case['client_inn']}\n"
     if client_block:
         client_block += "\n"
@@ -477,7 +539,7 @@ def generate_case_post() -> Optional[Dict]:
         structure=case.get("structure", "—"),
         result=case.get("result", "—"),
         region_effect=case.get("region_effect", "—"),
-        source_url=case.get("source_url", "—"),
+        source_url=src_url if has_real_source else "по материалам пресс-службы ЮЗБ",
         industry_tag=_industry_tag(case.get("industry", "")),
     )
     logger.debug(
@@ -487,22 +549,31 @@ def generate_case_post() -> Optional[Dict]:
     return {
         "title": f"Кейс: {case.get('industry', '')} в {case.get('region', '')}",
         "content": content,
-        "source_url": case.get("source_url", ""),
+        "source_url": src_url,
     }
-
 
 # ================================================================
 # АНАЛИТИКА
 # ================================================================
 
 def generate_analytics_post() -> Dict:
+    analytics = load_analytics()
+    if not analytics:
+        # Фолбэк — пустой пост-заглушка, если JSON не найден
+        logger.error("Файл analytics.json пуст или не найден")
+        return {
+            "title": "Аналитика рынка",
+            "content": "📈 Аналитика временно недоступна.",
+            "source_url": "",
+        }
+
     today = date.today()
-    relevant = [a for a in ANALYTICS if a.get("year") == today.year]
-    dropped = len(ANALYTICS) - len(relevant)
+    relevant = [a for a in analytics if a.get("year") == today.year]
+    dropped = len(analytics) - len(relevant)
 
     if dropped > 0:
         logger.info(
-            f"Аналитика: всего {len(ANALYTICS)}, за {today.year} год — "
+            f"Аналитика: всего {len(analytics)}, за {today.year} год — "
             f"{len(relevant)}, отброшено по году — {dropped}"
         )
 
@@ -510,21 +581,35 @@ def generate_analytics_post() -> Dict:
         logger.warning(
             f"Нет аналитики за {today.year} год — использую общий список"
         )
-        relevant = ANALYTICS
+        relevant = analytics
 
     data = random.choice(relevant)
+
+    # Формируем строку со ссылкой
+    src_url = data.get("source_url", "")
+    has_real_source = bool(src_url) and "пример-пресс-релиза" not in src_url
+
+    if has_real_source:
+        source_url_line = f"🔗 Первоисточник:\n{src_url}"
+    else:
+        source_url_line = ""
+
     content = TEMPLATES["analytics"].format(
         content=data["content"],
         insight=data["insight"],
         source=data.get("source", "—"),
+        source_url_line=source_url_line,
         industry_tag=_industry_tag(data.get("industry", "")),
+    )
+    logger.debug(
+        f"Выбрана аналитика: {data.get('industry', '—')} "
+        f"({data.get('source', '—')})"
     )
     return {
         "title": "Аналитика рынка",
         "content": content,
-        "source_url": data.get("source", ""),
+        "source_url": src_url,
     }
-
 
 # ================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
@@ -592,158 +677,3 @@ def generate_post() -> Dict:
 
     logger.info("Пост-аналитика сгенерирован")
     return generate_analytics_post()
-
-
-# ================================================================
-# ДАННЫЕ: КЕЙСЫ И АНАЛИТИКА
-# ================================================================
-
-CASES = [
-    {
-        "year": 2026,
-        "client_name": "ООО «Кубань-Агро»",
-        "client_inn": "2312345678",
-        "industry": "АПК",
-        "region": "Краснодарский край",
-        "deal_type": "Возобновляемая кредитная линия",
-        "deal_amount": "1 млрд рублей",
-        "deal_term": "3 года с автоматической пролонгацией",
-        "deal_place": "г. Краснодар, ул. Красная, 100, офис Юго-Западного банка",
-        "deal_period": f"I квартал {datetime.now().year} года",
-        "purpose": (
-            "Закупка сырья для обеспечения непрерывного цикла переработки, "
-            "а также модернизация производственной линии по глубокой "
-            "переработке зерна."
-        ),
-        "structure": (
-            "Транш-кредитование с возможностью выбора процентной ставки "
-            "(фиксированная или плавающая). Обеспечение — залог "
-            "производственного оборудования и поручительство материнской "
-            "компании."
-        ),
-        "result": (
-            "Увеличение мощности переработки на 40%, рост выручки на 22%, "
-            "выход на экспортные рынки Ближнего Востока и Азии."
-        ),
-        "region_effect": (
-            "Создано 120 новых рабочих мест, увеличены налоговые поступления "
-            "в бюджет края, укреплены экспортные позиции региона."
-        ),
-        "source_url": "https://пример-пресс-релиза.ru/kuban-agro-2026",
-    },
-    {
-        "year": 2026,
-        "client_name": "АО «Ростсельмаш»",
-        "client_inn": "6161234567",
-        "industry": "Машиностроение",
-        "region": "Ростовская область",
-        "deal_type": "Банковская гарантия",
-        "deal_amount": "4,2 млрд рублей",
-        "deal_term": "24 месяца",
-        "deal_place": "г. Ростов-на-Дону, ул. Большая Садовая, 45",
-        "deal_period": f"I квартал {datetime.now().year} года",
-        "purpose": (
-            "Обеспечение исполнения контрактов при строительстве нового "
-            "завода по выпуску широкой линейки сельхозтехники."
-        ),
-        "structure": (
-            "Безотзывная банковская гарантия с возможностью пролонгации. "
-            "Обеспечение — поручительство головной компании группы."
-        ),
-        "result": (
-            "Создано 500 рабочих мест, локализация производства достигла 80%, "
-            "запущены поставки в 12 регионов России."
-        ),
-        "region_effect": (
-            "Ростовская область укрепила статус центра российского "
-            "сельхозмашиностроения, выросли смежные производства."
-        ),
-        "source_url": "https://пример-пресс-релиза.ru/rostselmash-2026",
-    },
-    {
-        "year": 2026,
-        "client_name": "ООО «Крым-Курорт»",
-        "client_inn": "9101234567",
-        "industry": "Туризм",
-        "region": "Республика Крым",
-        "deal_type": "Проектное финансирование",
-        "deal_amount": "2,8 млрд рублей",
-        "deal_term": "7 лет",
-        "deal_place": "г. Симферополь, пр. Кирова, 12, офис ЮЗБ",
-        "deal_period": f"I квартал {datetime.now().year} года",
-        "purpose": (
-            "Реконструкция номерного фонда санаторно-курортного комплекса "
-            "и строительство нового СПА-центра."
-        ),
-        "structure": (
-            "Проектное финансирование с графиком выборки под этапы "
-            "строительства. Обеспечение — залог земельного участка и "
-            "будущих объектов недвижимости."
-        ),
-        "result": (
-            "Увеличение номерного фонда на 180 мест, рост загрузки на 25% "
-            "в сезон."
-        ),
-        "region_effect": (
-            "Рост турпотока в регионе, развитие малого бизнеса вокруг "
-            "курорта (питание, экскурсии, транспорт)."
-        ),
-        "source_url": "https://пример-пресс-релиза.ru/crimea-kurort-2026",
-    },
-]
-
-
-ANALYTICS = [
-    {
-        "year": 2026,
-        "industry": "АПК",
-        "content": (
-            f"Портфель проектов Юго-Западного банка Сбербанка на Кубани "
-            f"достиг 239 млрд рублей по итогам I квартала "
-            f"{datetime.now().year} года. Лидеры по объёму: Краснодарский "
-            f"край (212 млрд), Ростовская область (11 млрд), Ставрополье "
-            f"(9 млрд). Приоритетные направления — интенсивное садоводство, "
-            f"глубокая переработка продукции и экспорт."
-        ),
-        "insight": (
-            "Компаниям из Ростовской области и Ставрополья стоит активнее "
-            "использовать инструменты банка — потенциал роста портфеля в этих "
-            "регионах ещё не раскрыт. Особенно перспективны проекты, "
-            "ориентированные на экспорт."
-        ),
-        "source": f"Пресс-служба Сбербанка, I квартал {datetime.now().year}",
-    },
-    {
-        "year": 2026,
-        "industry": "Цифровизация",
-        "content": (
-            f"Более 185 компаний юга России проходят цифровую трансформацию "
-            f"с помощью акселератора DTaaS от Сбера по состоянию на "
-            f"I квартал {datetime.now().year} года. Участники — "
-            f"представители крупного и среднего бизнеса из Ростова-на-Дону, "
-            f"Краснодара, Ставрополя и Симферополя."
-        ),
-        "insight": (
-            "Цифровизация процессов сокращает издержки на 15–20% в первый "
-            "год. Стоит рассмотреть участие в следующей волне акселератора — "
-            "это бесплатно и даёт доступ к экспертизе Сбера."
-        ),
-        "source": f"Пресс-релиз Сбера, {datetime.now().year}",
-    },
-    {
-        "year": 2026,
-        "industry": "Туризм",
-        "content": (
-            f"Туристический поток на Юг России в I квартале "
-            f"{datetime.now().year} года вырос на 18% год к году. "
-            f"Краснодарский край, Крым и Ставрополье — лидеры по числу "
-            f"размещённых туристов."
-        ),
-        "insight": (
-            "Инвесторам в туристическую инфраструктуру стоит рассмотреть "
-            "проектное финансирование — ставки по таким проектам "
-            "субсидируются в рамках госпрограммы развития туризма."
-        ),
-        "source": f"Аналитика Ростуризма, I квартал {datetime.now().year}",
-    },
-]
