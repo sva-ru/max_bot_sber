@@ -12,6 +12,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger("content_generator").setLevel(logging.DEBUG)
+
 async def main():
         init_db()
         logger.info("База данных инициализирована.")
