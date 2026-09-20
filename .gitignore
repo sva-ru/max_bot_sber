@@ -1,0 +1,24 @@
+# Секреты
+.env
+
+# Логи
+*.log
+channel.log
+rss_rejected.log
+
+# База данных
+*.db
+channel_posts.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
