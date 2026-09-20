@@ -10,8 +10,9 @@ from typing import Optional, Dict, List
 import feedparser
 
 from gigachat_client import generate_text_safe
-from url_utils import resolve_url
 from config import CONTENT_DIR
+from url_utils import resolve_url, validate_source_url
+
 
 logger = logging.getLogger(__name__)
 rejected = logging.getLogger("rss_rejected")
@@ -493,6 +494,12 @@ def generate_news_post(news_item: Dict) -> Optional[Dict]:
 # ================================================================
 
 def generate_case_post() -> Optional[Dict]:
+    """
+    Формирует пост-кейс из content/cases.json.
+    - Отбирает кейсы за текущий год.
+    - Проверяет, что source_url реально открывается.
+    - Блок «Клиент/ИНН» выводится только при рабочей ссылке.
+    """
     cases = load_cases()
     if not cases:
         logger.warning("Список кейсов пуст или файл не найден")
@@ -514,17 +521,31 @@ def generate_case_post() -> Optional[Dict]:
 
     case = random.choice(relevant)
 
-    # Формируем блок «клиент» — только если есть публичный источник
-    src_url = case.get("source_url", "")
-    has_real_source = bool(src_url) and "пример-пресс-релиза" not in src_url
+    # --- Проверка ссылки на первоисточник ---
+    src_url = case.get("source_url", "").strip()
+    source_ok = validate_source_url(src_url)
+    if not source_ok:
+        if src_url:
+            logger.warning(
+                f"Ссылка-источник не работает, скрываю: {src_url}"
+            )
+        src_url = ""
 
+    # --- Блок «клиент» — только если есть рабочая публичная ссылка ---
     client_block = ""
-    if case.get("client_name") and has_real_source:
-        client_block += f"🏢 **Клиент:** {case['client_name']}\n"
-    if case.get("client_inn") and has_real_source:
-        client_block += f"🆔 **ИНН:** {case['client_inn']}\n"
-    if client_block:
-        client_block += "\n"
+    if source_ok:
+        if case.get("client_name"):
+            client_block += f"🏢 **Клиент:** {case['client_name']}\n"
+        if case.get("client_inn"):
+            client_block += f"🆔 **ИНН:** {case['client_inn']}\n"
+        if client_block:
+            client_block += "\n"
+
+    # --- Строка с источником ---
+    if source_ok:
+        source_line = f"🔗 {src_url}"
+    else:
+        source_line = "📄 По материалам пресс-службы Юго-Западного банка."
 
     content = TEMPLATES["case"].format(
         client_block=client_block,
@@ -539,31 +560,42 @@ def generate_case_post() -> Optional[Dict]:
         structure=case.get("structure", "—"),
         result=case.get("result", "—"),
         region_effect=case.get("region_effect", "—"),
-        source_url=src_url if has_real_source else "по материалам пресс-службы ЮЗБ",
+        source_line=source_line,
         industry_tag=_industry_tag(case.get("industry", "")),
     )
+
     logger.debug(
         f"Выбран кейс: «{case.get('client_name', '—')}» "
-        f"({case.get('industry', '—')}, {case.get('region', '—')})"
+        f"({case.get('industry', '—')}, {case.get('region', '—')}), "
+        f"ссылка {'есть' if source_ok else 'отсутствует'}"
     )
+
     return {
         "title": f"Кейс: {case.get('industry', '')} в {case.get('region', '')}",
         "content": content,
         "source_url": src_url,
     }
-
 # ================================================================
 # АНАЛИТИКА
 # ================================================================
 
 def generate_analytics_post() -> Dict:
+    """
+    Формирует пост-аналитику из content/analytics.json.
+    - Отбирает записи за текущий год.
+    - Проверяет, что source_url реально открывается.
+    - Если ссылка битая — выводит только текстовое название источника.
+    """
     analytics = load_analytics()
     if not analytics:
-        # Фолбэк — пустой пост-заглушка, если JSON не найден
-        logger.error("Файл analytics.json пуст или не найден")
+        logger.error("Файл analytics.json пуст или не прошёл валидацию")
         return {
             "title": "Аналитика рынка",
-            "content": "📈 Аналитика временно недоступна.",
+            "content": (
+                "📈 **Аналитика для крупного и среднего бизнеса**\n\n"
+                "Данные временно недоступны.\n\n"
+                "#Аналитика #БизнесЮга #СберЮЗБ"
+            ),
             "source_url": "",
         }
 
@@ -585,12 +617,19 @@ def generate_analytics_post() -> Dict:
 
     data = random.choice(relevant)
 
-    # Формируем строку со ссылкой
-    src_url = data.get("source_url", "")
-    has_real_source = bool(src_url) and "пример-пресс-релиза" not in src_url
+    # --- Проверка ссылки на первоисточник ---
+    src_url = data.get("source_url", "").strip()
+    source_ok = validate_source_url(src_url)
+    if not source_ok:
+        if src_url:
+            logger.warning(
+                f"Ссылка-источник не работает, скрываю: {src_url}"
+            )
+        src_url = ""
 
-    if has_real_source:
-        source_url_line = f"🔗 Первоисточник:\n{src_url}"
+    # --- Строка с источником ---
+    if source_ok:
+        source_url_line = f"🔗 {src_url}"
     else:
         source_url_line = ""
 
@@ -601,16 +640,18 @@ def generate_analytics_post() -> Dict:
         source_url_line=source_url_line,
         industry_tag=_industry_tag(data.get("industry", "")),
     )
+
     logger.debug(
         f"Выбрана аналитика: {data.get('industry', '—')} "
-        f"({data.get('source', '—')})"
+        f"({data.get('source', '—')}), "
+        f"ссылка {'есть' if source_ok else 'отсутствует'}"
     )
+
     return {
         "title": "Аналитика рынка",
         "content": content,
         "source_url": src_url,
     }
-
 # ================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ================================================================

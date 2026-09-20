@@ -7,9 +7,8 @@
 - убирает UTM-метки;
 - проверяет доступность URL.
 """
-import logging
 from urllib.parse import urlparse, urlunparse, quote, urljoin, parse_qsl, urlencode
-
+import logging
 import requests
 
 logger = logging.getLogger(__name__)
@@ -103,4 +102,24 @@ def is_url_alive(url: str, timeout: int = 5) -> bool:
         return resp.status_code < 400
     except Exception as e:
         logger.warning(f"URL недоступен {url}: {e}")
+        return False
+
+def validate_source_url(url: str, timeout: int = 5) -> bool:
+    """
+    Проверяет, что URL реально открывается (HTTP 200).
+    Возвращает True, если страница доступна.
+    """
+    if not url or "пример-пресс-релиза" in url:
+        return False
+    try:
+        resp = requests.head(
+            url, allow_redirects=True, timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if resp.status_code >= 400:
+            logger.warning(f"Источник недоступен [{resp.status_code}]: {url}")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Ошибка проверки ссылки {url}: {e}")
         return False
