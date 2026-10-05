@@ -67,6 +67,7 @@ _RSSHUB_PATHS = [
     "telegram/channel/rbc_krasnodar",
     "telegram/channel/minec_tourism",
     "telegram/channel/nationalprojectsru",
+
 ]
 
 RSS_SOURCES = _STATIC_SOURCES + [
