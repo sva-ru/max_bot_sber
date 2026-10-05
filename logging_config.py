@@ -1,24 +1,23 @@
+# logging_config.py
 """
 Настройка логирования проекта.
 
-Основной лог       → stdout + channel.log (INFO+)
-Лог отбраковки RSS → rss_rejected.log (DEBUG, только отброшенные записи)
+Основной лог       → stdout + logs/channel.log (INFO+)
+Лог отбраковки RSS → logs/rss_rejected.log (DEBUG, только отброшенные)
 """
 import logging
 import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
-MAIN_LOG = BASE_DIR / "channel.log"
-REJECTED_LOG = BASE_DIR / "rss_rejected.log"
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+MAIN_LOG = LOG_DIR / "channel.log"
+REJECTED_LOG = LOG_DIR / "rss_rejected.log"
 
 
 def setup_logging(debug: bool = False) -> None:
-    """
-    Настраивает корневой логгер и логгер отбраковки RSS.
-
-    :param debug: если True — основной лог пишет DEBUG.
-    """
     root_level = logging.DEBUG if debug else logging.INFO
 
     # --- Основной логгер ---

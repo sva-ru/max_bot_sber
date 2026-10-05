@@ -1,29 +1,274 @@
-# content_generator.py (начало файла)
-import json
+# content_generator.py
+"""
+Генератор контента для канала «Бизнес-Фактор Юго-Запад».
+
+Публикуются ТОЛЬКО свежие новости из RSS и RSSHub.
+Кейсы и аналитика из JSON больше не используются.
+
+Фильтры (в порядке применения):
+1. Очистка HTML и отсев «плохих» заголовков.
+2. По дате (DATE_FILTER: quarter / year / none).
+3. Чёрный список — спорт, шоу-бизнес, погода, ЧС,
+   политика, международка, макроэкономика США.
+4. Региональная привязка — обязательна (кроме доверенных).
+5. Белый список — бизнес-лексика (для нетрастевых источников).
+"""
+import html as html_module
 import logging
 import random
 import re
 from datetime import date, datetime
-from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
+from urllib.parse import urlparse
 
 import feedparser
 
 from gigachat_client import generate_text_safe
-from config import CONTENT_DIR
-from url_utils import resolve_url, validate_source_url
-
+from url_utils import resolve_url
+from config import (
+    DATE_FILTER,
+    RSSHUB_ACCESS_KEY,
+    RSSHUB_BASE_URL,
+)
 
 logger = logging.getLogger(__name__)
 rejected = logging.getLogger("rss_rejected")
 
-RSS_SOURCES = [
-    "https://sberbank.ru/ru/s_m_business/news/rss",
-    "https://kuban.rbc.ru/rss",
-    "https://rostov.rbc.ru/rss",
-    "https://expertsouth.ru/rss/",
-    "https://stav.aif.ru/rss",
+
+# ================================================================
+# RSSHUB
+# ================================================================
+
+def rsshub_url(path: str) -> str:
+    if not RSSHUB_BASE_URL or not RSSHUB_ACCESS_KEY:
+        return ""
+    path = path.lstrip("/")
+    return f"{RSSHUB_BASE_URL}/{path}?key={RSSHUB_ACCESS_KEY}"
+
+
+# ================================================================
+# RSS-ИСТОЧНИКИ
+# ================================================================
+
+_STATIC_SOURCES = [
+    "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+    "https://www.kommersant.ru/RSS/main.xml",
 ]
+
+_RSSHUB_PATHS = [
+    "telegram/channel/rbc_kavkaz",
+    "telegram/channel/kavkaz_rf",
+    "telegram/channel/GorodNRostov",
+    "telegram/channel/atorus",
+    "telegram/channel/expertsouth",
+]
+
+RSS_SOURCES = _STATIC_SOURCES + [
+    url for url in (rsshub_url(p) for p in _RSSHUB_PATHS) if url
+]
+
+
+# ================================================================
+# ОЧИСТКА HTML И ЗАГОЛОВКОВ
+# ================================================================
+
+_HTML_TAG = re.compile(r"<[^>]+>")
+_MULTIPLE_SPACES = re.compile(r"[ \t]{2,}")
+_MULTIPLE_NEWLINES = re.compile(r"\n{3,}")
+
+DATE_ONLY_TITLE = re.compile(
+    r"^\s*(?:"
+    r"\d{1,2}\s+"
+    r"(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*"
+    r"(?:\s+\d{4})?"
+    r"|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье"
+    r"|\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+MIN_TITLE_LENGTH = 15
+
+
+def clean_html(text: str) -> str:
+    """Убирает HTML-теги, декодирует сущности, чистит пробелы."""
+    if not text:
+        return ""
+
+    text = re.sub(r"</(p|div|br|li|h[1-6])>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = _HTML_TAG.sub("", text)
+    text = html_module.unescape(text)
+    text = _MULTIPLE_SPACES.sub(" ", text)
+    text = _MULTIPLE_NEWLINES.sub("\n\n", text)
+
+    return text.strip()
+
+
+def is_meaningful_title(title: str) -> bool:
+    """Отсеивает заголовки-даты, дни недели и слишком короткие."""
+    if not title:
+        return False
+    t = title.strip()
+    if len(t) < MIN_TITLE_LENGTH:
+        return False
+    if DATE_ONLY_TITLE.match(t):
+        return False
+    return True
+
+
+# ================================================================
+# ФИЛЬТР РЕЛЕВАНТНОСТИ
+# ================================================================
+
+TRUSTED_HOSTS = {
+    "sberbank.ru",
+    "www.sberbank.ru",
+    "expertsouth.ru",
+    "www.expertsouth.ru",
+}
+
+BLACKLIST_KEYWORDS = [
+    # Спорт
+    "теннис", "джокович", "надаль", "медведев выиграл",
+    "atp ", "wta ", "атп ", "втб арена",
+    "футбол", "рпл ", "кхл ", "нба ", "фифа", "уефа", "премьер-лига",
+    "олимпиад", "олимпийск",
+    "хокке", "баскетбол", "волейбол", "бокс", "ufc", "мма ",
+    "формула-1", "гонк",
+    "матч", "турнир", "полуфинал", "четвертьфинал", "чемпионат", "кубок",
+    "зенит", "спартак", "цска", "динамо", "краснодар сыграл",
+    # Шоу-бизнес
+    "шоу-бизнес", "селебрити", "актер", "актрис", "актёр",
+    "фильм вышел", "премьера фильма", "сериал", "концерт", "евровидение",
+    "мисс вселенная", "блогер", "тиктокер", "инфлюенсер",
+    # Погода и ЧС
+    "циклон", "антициклон", "ураган", "наводнение", "землетрясение",
+    "паводок", "штормовое предупреждение", "аномальная жара", "гололёд",
+    # Здоровье, эзотерика
+    "коронавирус", "covid", "вакцин", "эпидеми", "птичий грипп",
+    "гороскоп", "астролог",
+    # Политика и международка
+    "трамп", "байден", "путин", "зеленский", "макрон",
+    "белый дом", "конгресс сша", "сенат сша", "госдеп",
+    "сша", "америк", "евросоюз", "нато",
+    "санкц", "эмбарго",
+    "выборы", "предвыборн", "кандидат в президент",
+    "госдума приняла", "законопроект", "поправк в закон",
+    "минфин сша", "фрс ", "федеральная резервная",
+    "опек", "оон", "брикс", "глобальн",
+    # Макро без привязки
+    "биткоин", "криптовалют", "эфириум",
+    "нефть марки", "цена на нефть", "brent", "urals",
+    "курс доллара", "курс евро", "ключевая ставка цб",
+    "инфляция в россии", "ввп россии",
+]
+
+REGIONAL_ANCHORS = [
+    # ЮФО
+    "краснодар", "кубан", "сочи", "новороссийск", "анап",
+    "армавир", "геленджик", "туапсе",
+    "ростов", "таганрог", "шахты", "новочеркасск", "волгодонск",
+    "ставропол", "пятигорск", "кисловодск", "ессентуки", "георгиевск",
+    "адыге", "майкоп", "калмык", "элист",
+    # Крым
+    "крым", "симферопол", "севастопол", "ялта", "керч", "феодоси",
+    "евпатори", "саки", "судак",
+    # СКФО
+    "дагестан", "махачкал", "дербент", "каспийск",
+    "чечн", "грозн",
+    "кабард", "балкар", "нальчик",
+    "осети", "владикавказ", "беслан",
+    "ингушет", "магас", "назран",
+    "карачаев", "черкесск",
+    # Обобщённые
+    "северный кавказ", "северо-кавказск",
+    "юг россии", "южный федеральный", "юфо", "скфо",
+    "юго-западн", "юзб", "юго-западный банк",
+]
+
+WHITELIST_KEYWORDS = [
+    # Бизнес
+    "компани", "корпораци", "фирм", "предприят", "стартап", "предпринимател",
+    "ооо ", "ао ", "пао ", "зао ", "бизнес", "мсп ", "малому и среднему",
+    "крупному бизнесу",
+    # Финансы
+    "инвестор", "инвестиц", "инвестпроект", "кредит", "заем", "заём",
+    "финансировани", "банк", "сбер", "втб", "газпромбанк", "альфа-банк",
+    "сделк", "контракт", "соглашени", "договор",
+    "млрд", "млн", "миллиард", "миллион", "тыс. руб",
+    "выручк", "прибыл", "оборот", "капитал", "налог", "субсиди",
+    "льготн", "ставк", "акци", "облигац", "бирж",
+    # Отрасли
+    "апк", "агро", "сельхоз", "сельское хозяйство", "зерн", "молок",
+    "птицевод", "тепличн", "машиностро", "металлург", "металлообработк",
+    "станкостро", "туризм", "курорт", "гостин", "отел", "санатор",
+    "логистик", "транспор", "склад", "строительств", "девелопер",
+    "недвижимост", "ритейл", "торгов", "розничн", "оптов",
+    "экспорт", "импорт", "внешнеэкономическа",
+    "производств", "завод", "фабрик", "цех", "промышленн",
+    "элеватор", "агрохолдинг", "птицефабрик", "молочн", "сыровар",
+    "винодел", "виноград", "садовод", "виноградар",
+    "комбайн", "трактор", "сельхозтехник", "спецтехник",
+    "агропром", "агроэкспорт", "продовольствен",
+    "рыболов", "рыбовод", "аквакультур",
+    "порт", "терминал", "контейнер", "грузооборот",
+    "госзакупк", "тендер", "аукцион", "закупк",
+    "модернизац", "реконструкц", "капремонт",
+    "франшиз", "маркетплейс",
+    "газпром", "роснефт", "лукойл", "роснано", "ростех",
+    # Технологии
+    "цифровизац", "it-", "ит-", "технологи", "инновац",
+    "искусственный интеллект", "ии ",
+    # Господдержка
+    "господдержк", "нацпроект", "национальн проект", "гчп", "концесси",
+    "особая экономическая зона", "тосэр", "резидент", "меры поддержки",
+]
+
+
+def _hostname(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _find_keyword(text_lower: str, keywords: list) -> Optional[str]:
+    for kw in keywords:
+        if kw in text_lower:
+            return kw
+    return None
+
+
+def has_regional_anchor(text_lower: str) -> bool:
+    return any(a in text_lower for a in REGIONAL_ANCHORS)
+
+
+def is_relevant_news(text: str, source_url: str = "") -> Tuple[bool, str]:
+    if not text or not text.strip():
+        return False, "empty"
+
+    text_lower = text.lower()
+
+    # 1. Чёрный список
+    hit = _find_keyword(text_lower, BLACKLIST_KEYWORDS)
+    if hit:
+        return False, f"blacklist:{hit}"
+
+    # 2. Доверенные источники — пропускаем
+    if _hostname(source_url) in TRUSTED_HOSTS:
+        return True, "trusted"
+
+    # 3. Региональная привязка
+    if not has_regional_anchor(text_lower):
+        return False, "no-region"
+
+    # 4. Белый список
+    hit = _find_keyword(text_lower, WHITELIST_KEYWORDS)
+    if hit:
+        return True, f"whitelist:{hit}"
+
+    return False, "no-whitelist"
 
 
 # ================================================================
@@ -50,15 +295,19 @@ def is_current_period(entry_date: Optional[date]) -> bool:
     if entry_date is None:
         return False
     today = date.today()
+    if entry_date > today:
+        return False
+    if DATE_FILTER == "none":
+        return True
     if entry_date.year != today.year:
         return False
-    if current_quarter(entry_date) != current_quarter(today):
-        return False
-    return True
+    if DATE_FILTER == "year":
+        return True
+    return current_quarter(entry_date) == current_quarter(today)
 
 
 # ================================================================
-# ИЗВЛЕЧЕНИЕ ИНН И НАЗВАНИЙ КОМПАНИЙ
+# ИЗВЛЕЧЕНИЕ ИНН / КОМПАНИЙ
 # ================================================================
 
 INN_PATTERN = re.compile(r"\b(?:ИНН[:\s]*)?(\d{10}|\d{12})\b")
@@ -93,63 +342,9 @@ def extract_company_name(text: str) -> Optional[str]:
 def extract_urls(text: str) -> list:
     return URL_PATTERN.findall(text or "")
 
-# ================================================================
-# ЗАГРУЗКА КЕЙСОВ И АНАЛИТИКИ ИЗ JSON
-# ================================================================
-
-CASES_FILE = Path(CONTENT_DIR) / "cases.json"
-ANALYTICS_FILE = Path(CONTENT_DIR) / "analytics.json"
-
-
-def load_cases() -> List[Dict]:
-    """
-    Читает кейсы из content/cases.json.
-    Файл перечитывается при каждом вызове — правки видны без перезапуска.
-    """
-    if not CASES_FILE.exists():
-        logger.warning(f"Файл кейсов не найден: {CASES_FILE}")
-        return []
-    try:
-        with CASES_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            logger.error(f"cases.json должен содержать массив, а не {type(data)}")
-            return []
-        logger.debug(f"Загружено кейсов: {len(data)}")
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Ошибка JSON в cases.json: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Ошибка чтения cases.json: {e}")
-        return []
-
-
-def load_analytics() -> List[Dict]:
-    """
-    Читает аналитику из content/analytics.json.
-    Файл перечитывается при каждом вызове.
-    """
-    if not ANALYTICS_FILE.exists():
-        logger.warning(f"Файл аналитики не найден: {ANALYTICS_FILE}")
-        return []
-    try:
-        with ANALYTICS_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            logger.error(f"analytics.json должен содержать массив, а не {type(data)}")
-            return []
-        logger.debug(f"Загружено аналитики: {len(data)}")
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Ошибка JSON в analytics.json: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Ошибка чтения analytics.json: {e}")
-        return []
 
 # ================================================================
-# ШАБЛОНЫ
+# ШАБЛОН НОВОСТИ
 # ================================================================
 
 TEMPLATES = {
@@ -162,71 +357,41 @@ TEMPLATES = {
         "🔗 Первоисточник:\n{link}\n\n"
         "#ЮгБизнес #СберЮЗБ #КрупныйБизнес #{industry_tag}"
     ),
-
-    "case": (
-        "💼 **Кейс клиента Юго-Западного банка**\n\n"
-        "{client_block}"
-        "📌 **Отрасль:** {industry}\n"
-        "📍 **Регион:** {region}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🤝 **Сделка:** {deal_type}\n"
-        "💰 **Сумма:** {deal_amount}\n"
-        "⏳ **Срок:** {deal_term}\n"
-        "🏛️ **Место проведения сделки:** {deal_place}\n"
-        "📅 **Период:** {deal_period}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 **Цель финансирования:**\n"
-        "{purpose}\n\n"
-        "⚙️ **Структура сделки:**\n"
-        "{structure}\n\n"
-        "📈 **Результат для клиента:**\n"
-        "{result}\n\n"
-        "🌍 **Эффект для региона:**\n"
-        "{region_effect}\n\n"
-        "🔗 Первоисточник:\n{source_url}\n\n"
-        "#КейсыКлиентов #СберЮЗБ #БизнесЮга #{industry_tag}"
-    ),
-
-    "analytics": (
-    "📈 **Аналитика для крупного и среднего бизнеса**\n\n"
-    "{content}\n\n"
-    "💼 **Практический вывод:**\n"
-    "{insight}\n\n"
-    "🔗 Источник: {source}\n"
-    "{source_url_line}\n"
-    "#Аналитика #БизнесЮга #СберЮЗБ #{industry_tag}"
-    ),
 }
 
+
 # ================================================================
-# RSS СБОР С ФИЛЬТРАЦИЕЙ И ЛОГИРОВАНИЕМ
+# СБОР RSS
 # ================================================================
 
-def fetch_rss_news(limit_per_source: int = 10) -> List[Dict]:
-    """
-    Собирает RSS-новости за текущий год и квартал.
-    Принятые → основной лог + возвращаемый список.
-    Отброшенные → rss_rejected.log (DEBUG).
-    """
+def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
     news_items: List[Dict] = []
     today = date.today()
     q = current_quarter(today)
 
     stats = {
         "total": 0, "accepted": 0,
-        "wrong_year": 0, "wrong_quarter": 0, "no_date": 0,
+        "wrong_year": 0, "wrong_quarter": 0, "no_date": 0, "future": 0,
+        "rej_blacklist": 0, "rej_no_region": 0, "rej_no_whitelist": 0,
+        "bad_title": 0,
         "with_inn": 0, "with_company": 0,
     }
 
+    rsshub_count = len([
+        u for u in RSS_SOURCES
+        if RSSHUB_BASE_URL and RSSHUB_BASE_URL in u
+    ])
     logger.info(
-        f"Начинаю сбор RSS. Период: {today.year} год, {q} квартал. "
-        f"Источников: {len(RSS_SOURCES)}"
+        f"Начинаю сбор RSS. Фильтр дат: {DATE_FILTER}. "
+        f"Период: {today.year} год, {q} квартал. "
+        f"Источников: {len(RSS_SOURCES)} (из них RSSHub: {rsshub_count}). "
+        f"Лимит с источника: {limit_per_source}"
     )
 
     rejected.info("=" * 90)
     rejected.info(
         f"ОТБРАКОВКА RSS. Запуск: {datetime.now():%Y-%m-%d %H:%M:%S}. "
-        f"Период: {today.year} год, {q} квартал"
+        f"Фильтр дат: {DATE_FILTER}"
     )
     rejected.info("=" * 90)
 
@@ -238,6 +403,9 @@ def fetch_rss_news(limit_per_source: int = 10) -> List[Dict]:
             src_wrong_year = 0
             src_wrong_quarter = 0
             src_no_date = 0
+            src_future = 0
+            src_irrelevant = 0
+            src_bad_title = 0
 
             if src_total == 0:
                 logger.warning(f"[{url}] лента пуста (0 записей)")
@@ -249,62 +417,77 @@ def fetch_rss_news(limit_per_source: int = 10) -> List[Dict]:
             for entry in feed.entries:
                 stats["total"] += 1
                 entry_date = parse_entry_date(entry)
-                title = entry.get("title", "—")[:80]
-                raw_link = entry.get("link", "")
 
-                # Фильтр: нет даты
+                # --- Очистка HTML ---
+                raw_title = clean_html(entry.get("title", ""))
+                raw_summary = clean_html(entry.get("summary", ""))[:700]
+                raw_link = entry.get("link", "")
+                title = raw_title[:80]
+
+                # --- Фильтр «плохих» заголовков ---
+                if not is_meaningful_title(raw_title):
+                    stats["bad_title"] += 1
+                    src_bad_title += 1
+                    rejected.info(f"  [BAD_TITLE] «{raw_title}»")
+                    continue
+
+                # --- Дата ---
                 if entry_date is None:
                     stats["no_date"] += 1
                     src_no_date += 1
-                    rejected.info(
-                        f"  [NO_DATE] «{title}»\n"
-                        f"            ссылка: {raw_link}"
-                    )
+                    rejected.info(f"  [NO_DATE] «{title}»")
                     continue
 
-                # Фильтр: не текущий год
-                if entry_date.year != today.year:
+                if entry_date > today:
+                    stats["future"] += 1
+                    src_future += 1
+                    rejected.info(f"  [FUTURE {entry_date.isoformat()}] «{title}»")
+                    continue
+
+                if DATE_FILTER in ("year", "quarter") and entry_date.year != today.year:
                     stats["wrong_year"] += 1
                     src_wrong_year += 1
-                    rejected.info(
-                        f"  [WRONG_YEAR {entry_date.year}] «{title}»\n"
-                        f"            ссылка: {raw_link}"
-                    )
+                    rejected.info(f"  [WRONG_YEAR {entry_date.year}] «{title}»")
                     continue
 
-                # Фильтр: не текущий квартал
-                if current_quarter(entry_date) != q:
+                if DATE_FILTER == "quarter" and current_quarter(entry_date) != q:
                     stats["wrong_quarter"] += 1
                     src_wrong_quarter += 1
                     rejected.info(
-                        f"  [WRONG_QUARTER Q{current_quarter(entry_date)}] "
-                        f"«{title}»\n"
-                        f"            дата: {entry_date.isoformat()}\n"
-                        f"            ссылка: {raw_link}"
+                        f"  [WRONG_QUARTER Q{current_quarter(entry_date)}] «{title}»"
                     )
                     continue
 
-                # Принято
+                # --- Релевантность ---
+                full_text = f"{title} {raw_summary}"
+                is_rel, reason = is_relevant_news(full_text, source_url=url)
+                if not is_rel:
+                    src_irrelevant += 1
+                    if reason.startswith("blacklist:"):
+                        stats["rej_blacklist"] += 1
+                    elif reason == "no-region":
+                        stats["rej_no_region"] += 1
+                    elif reason == "no-whitelist":
+                        stats["rej_no_whitelist"] += 1
+                    rejected.info(f"  [IRRELEVANT {reason}] «{title}»")
+                    continue
+
+                # --- Принято ---
                 stats["accepted"] += 1
                 src_accepted += 1
 
-                summary = entry.get("summary", "")
-                full_text = f"{title} {summary}"
-
                 inn = extract_inn(full_text)
                 company = extract_company_name(full_text)
-
                 if inn:
                     stats["with_inn"] += 1
                 if company:
                     stats["with_company"] += 1
 
-                # Нормализация ссылки
                 clean_link = resolve_url(raw_link, source_url=url)
 
                 news_items.append({
-                    "title": title,
-                    "summary": summary[:700],
+                    "title": raw_title,
+                    "summary": raw_summary,
                     "link": clean_link,
                     "raw_link": raw_link,
                     "published_date": entry_date.isoformat(),
@@ -314,21 +497,22 @@ def fetch_rss_news(limit_per_source: int = 10) -> List[Dict]:
                 })
 
                 logger.debug(
-                    f"[{url}] ПРИНЯТО ({entry_date.isoformat()}): «{title}»"
+                    f"[{url}] ПРИНЯТО ({reason}): «{title}»"
                     + (f" | ИНН: {inn}" if inn else "")
                     + (f" | Компания: {company}" if company else "")
                 )
 
                 if src_accepted >= limit_per_source:
-                    rejected.info(
-                        f"  (достигнут лимит {limit_per_source})"
-                    )
+                    rejected.info(f"  (достигнут лимит {limit_per_source})")
                     break
 
             logger.info(
                 f"[{url}] всего {src_total} | принято {src_accepted} | "
                 f"отброшено: год {src_wrong_year}, "
-                f"квартал {src_wrong_quarter}, без даты {src_no_date}"
+                f"квартал {src_wrong_quarter}, без даты {src_no_date}, "
+                f"будущее {src_future}, "
+                f"плохой заголовок {src_bad_title}, "
+                f"нерелевантных {src_irrelevant}"
             )
 
         except Exception as e:
@@ -340,24 +524,27 @@ def fetch_rss_news(limit_per_source: int = 10) -> List[Dict]:
         f"=== ИТОГ СБОРА RSS ===\n"
         f"  Всего записей: {stats['total']}\n"
         f"  Принято: {stats['accepted']} "
-        f"(с ИНН: {stats['with_inn']}, "
-        f"с компанией: {stats['with_company']})\n"
-        f"  Отброшено: {rejected_count} "
-        f"(год: {stats['wrong_year']}, "
-        f"квартал: {stats['wrong_quarter']}, "
-        f"без даты: {stats['no_date']})\n"
-        f"  Период: {today.year} год, {q} квартал"
+        f"(с ИНН: {stats['with_inn']}, с компанией: {stats['with_company']})\n"
+        f"  Отброшено: {rejected_count}\n"
+        f"    - не текущий год: {stats['wrong_year']}\n"
+        f"    - не текущий квартал: {stats['wrong_quarter']}\n"
+        f"    - без даты: {stats['no_date']}\n"
+        f"    - из будущего: {stats['future']}\n"
+        f"    - плохой заголовок: {stats['bad_title']}\n"
+        f"    - чёрный список: {stats['rej_blacklist']}\n"
+        f"    - нет региональной привязки: {stats['rej_no_region']}\n"
+        f"    - нет бизнес-лексики: {stats['rej_no_whitelist']}\n"
+        f"  Фильтр дат: {DATE_FILTER}. Период: {today.year} год, {q} квартал"
     )
     logger.info(summary_text)
-
     rejected.info("\n" + "=" * 90)
     rejected.info(summary_text)
     rejected.info("=" * 90)
 
     if stats["accepted"] == 0:
         logger.warning(
-            f"ВНИМАНИЕ: за {today.year} год, {q} квартал не найдено "
-            f"ни одной новости. Проверьте RSS-источники."
+            f"ВНИМАНИЕ: ни одной новости не прошло фильтр. "
+            f"Попробуйте ослабить фильтры или добавить источники."
         )
 
     return news_items
@@ -375,21 +562,17 @@ def _industry_tag(industry: str) -> str:
 
 
 # ================================================================
-# ГАРАНТИЯ ССЫЛКИ В ПОСТЕ
+# ГАРАНТИЯ ССЫЛКИ
 # ================================================================
 
 def _ensure_source_link(text: str, source_url: str) -> str:
-    """Гарантирует, что в тексте есть ссылка на первоисточник."""
     if not source_url:
         return text
-
     urls_in_text = extract_urls(text)
     tail = source_url.replace("https://", "").replace("http://", "").rstrip("/")
-
     for u in urls_in_text:
         if tail and tail in u:
             return text
-
     return text.rstrip() + f"\n\n🔗 Первоисточник:\n{source_url}"
 
 
@@ -410,7 +593,6 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
         known_facts.append(f"Компания (из источника): {news_item['company']}")
     if news_item.get("inn"):
         known_facts.append(f"ИНН (из источника): {news_item['inn']}")
-
     facts_block = "\n".join(known_facts) if known_facts else "—"
 
     prompt = f"""Ты — редактор делового канала «Бизнес-Фактор Юго-Запад» для клиентов крупного и среднего бизнеса Юго-Западного банка Сбербанка России.
@@ -420,32 +602,52 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
 Исходные данные:
 Заголовок: {news_item['title']}
 Содержание: {news_item.get('summary', '')}
-Ссылка (используй как есть, не изменяй): {news_item.get('link', '')}
+Ссылка: {news_item.get('link', '')}
 Дата публикации: {news_item.get('published_date', '—')}
 Период: {period_line}
 
 Известные факты о сделке/компании (только они достоверны):
 {facts_block}
 
-Жёсткие правила:
-1. Период публикации — только текущий год и текущий квартал.
+ПЕРВОЕ И ГЛАВНОЕ ПРАВИЛО — ПРОВЕРКА РЕЛЕВАНТНОСТИ:
+Если новость НЕ относится к одной из тем:
+  • бизнес, компании, предпринимательство;
+  • экономика, финансы, банки, инвестиции;
+  • промышленность, АПК, строительство, логистика, туризм;
+  • развитие регионов Юга России и Северного Кавказа;
+  • господдержка бизнеса, нацпроекты, ГЧП,
+— то верни РОВНО одно слово: SKIP
+
+НЕ пиши пост на темы: спорт, шоу-бизнес, погода и ЧС, происшествия, здоровье, политика и международка (США, ЕС, НАТО, санкции), макроэкономика без привязки к Югу России.
+
+Остальные правила:
+1. Период публикации — текущий год и текущий квартал.
 2. ИНН и название компании упоминай ТОЛЬКО если они есть в блоке «Известные факты». Если блока нет — не выдумывай.
 3. Никаких данных «по слухам» — только то, что есть в исходных данных.
 4. Объём: 1000–1800 символов.
+4a. В тексте поста НЕ должно быть HTML-тегов (<p>, <br>, <a>, <b> и т. п.).
+    Если в исходных данных есть теги — удали их.
 5. Структура:
-   • Яркий заголовок с эмодзи (📊, 💼, 📈, 🏭).
+   • Заголовок начинай РОВНО с одного эмодзи из набора: 📊 💼 📈 🏭.
    • Абзац 1 — суть: что произошло, кто участники, где, когда.
    • Абзац 2 — детали: суммы, условия, сроки, отрасли, регионы.
-   • Абзац 3 — «Что это значит для бизнеса Юга России»: практический вывод для предпринимателей Краснодарского края, Ростовской области, Ставрополья, Крыма и Северного Кавказа.
-   • 4–5 релевантных хэштегов в конце.
-6. Не упоминай, что текст сгенерирован ИИ.
+   • Абзац 3 — «Что это значит для бизнеса Юга России»: практический вывод.
+6. НЕ добавляй хэштеги — они будут добавлены автоматически.
+7. Не упоминай, что текст сгенерирован ИИ.
 
-Выведи только готовый текст поста, без пояснений.
+Выведи только готовый текст поста или одно слово SKIP.
 """
     generated = generate_text_safe(prompt, retries=2)
 
     if not generated:
         return generate_news_post(news_item)
+
+    if generated.strip().upper() == "SKIP":
+        logger.info(f"GigaChat вернул SKIP: «{news_item['title'][:60]}»")
+        return None
+
+    # Дополнительная страховка: чистим HTML, если GigaChat всё же вставил теги
+    generated = clean_html(generated)
 
     link = news_item.get("link", "")
     generated = _ensure_source_link(generated, link)
@@ -490,231 +692,32 @@ def generate_news_post(news_item: Dict) -> Optional[Dict]:
 
 
 # ================================================================
-# КЕЙС → ПОСТ
-# ================================================================
-
-def generate_case_post() -> Optional[Dict]:
-    """
-    Формирует пост-кейс из content/cases.json.
-    - Отбирает кейсы за текущий год.
-    - Проверяет, что source_url реально открывается.
-    - Блок «Клиент/ИНН» выводится только при рабочей ссылке.
-    """
-    cases = load_cases()
-    if not cases:
-        logger.warning("Список кейсов пуст или файл не найден")
-        return None
-
-    today = date.today()
-    relevant = [c for c in cases if c.get("year") == today.year]
-    dropped = len(cases) - len(relevant)
-
-    if dropped > 0:
-        logger.info(
-            f"Кейсы: всего {len(cases)}, за {today.year} год — "
-            f"{len(relevant)}, отброшено по году — {dropped}"
-        )
-
-    if not relevant:
-        logger.warning(f"Нет кейсов за {today.year} год — рубрика пропущена")
-        return None
-
-    case = random.choice(relevant)
-
-    # --- Проверка ссылки на первоисточник ---
-    src_url = case.get("source_url", "").strip()
-    source_ok = validate_source_url(src_url)
-    if not source_ok:
-        if src_url:
-            logger.warning(
-                f"Ссылка-источник не работает, скрываю: {src_url}"
-            )
-        src_url = ""
-
-    # --- Блок «клиент» — только если есть рабочая публичная ссылка ---
-    client_block = ""
-    if source_ok:
-        if case.get("client_name"):
-            client_block += f"🏢 **Клиент:** {case['client_name']}\n"
-        if case.get("client_inn"):
-            client_block += f"🆔 **ИНН:** {case['client_inn']}\n"
-        if client_block:
-            client_block += "\n"
-
-    # --- Строка с источником ---
-    if source_ok:
-        source_line = f"🔗 {src_url}"
-    else:
-        source_line = "📄 По материалам пресс-службы Юго-Западного банка."
-
-    content = TEMPLATES["case"].format(
-        client_block=client_block,
-        industry=case.get("industry", "—"),
-        region=case.get("region", "—"),
-        deal_type=case.get("deal_type", "—"),
-        deal_amount=case.get("deal_amount", "—"),
-        deal_term=case.get("deal_term", "—"),
-        deal_place=case.get("deal_place", "—"),
-        deal_period=case.get("deal_period", "—"),
-        purpose=case.get("purpose", "—"),
-        structure=case.get("structure", "—"),
-        result=case.get("result", "—"),
-        region_effect=case.get("region_effect", "—"),
-        source_line=source_line,
-        industry_tag=_industry_tag(case.get("industry", "")),
-    )
-
-    logger.debug(
-        f"Выбран кейс: «{case.get('client_name', '—')}» "
-        f"({case.get('industry', '—')}, {case.get('region', '—')}), "
-        f"ссылка {'есть' if source_ok else 'отсутствует'}"
-    )
-
-    return {
-        "title": f"Кейс: {case.get('industry', '')} в {case.get('region', '')}",
-        "content": content,
-        "source_url": src_url,
-    }
-# ================================================================
-# АНАЛИТИКА
-# ================================================================
-
-def generate_analytics_post() -> Dict:
-    """
-    Формирует пост-аналитику из content/analytics.json.
-    - Отбирает записи за текущий год.
-    - Проверяет, что source_url реально открывается.
-    - Если ссылка битая — выводит только текстовое название источника.
-    """
-    analytics = load_analytics()
-    if not analytics:
-        logger.error("Файл analytics.json пуст или не прошёл валидацию")
-        return {
-            "title": "Аналитика рынка",
-            "content": (
-                "📈 **Аналитика для крупного и среднего бизнеса**\n\n"
-                "Данные временно недоступны.\n\n"
-                "#Аналитика #БизнесЮга #СберЮЗБ"
-            ),
-            "source_url": "",
-        }
-
-    today = date.today()
-    relevant = [a for a in analytics if a.get("year") == today.year]
-    dropped = len(analytics) - len(relevant)
-
-    if dropped > 0:
-        logger.info(
-            f"Аналитика: всего {len(analytics)}, за {today.year} год — "
-            f"{len(relevant)}, отброшено по году — {dropped}"
-        )
-
-    if not relevant:
-        logger.warning(
-            f"Нет аналитики за {today.year} год — использую общий список"
-        )
-        relevant = analytics
-
-    data = random.choice(relevant)
-
-    # --- Проверка ссылки на первоисточник ---
-    src_url = data.get("source_url", "").strip()
-    source_ok = validate_source_url(src_url)
-    if not source_ok:
-        if src_url:
-            logger.warning(
-                f"Ссылка-источник не работает, скрываю: {src_url}"
-            )
-        src_url = ""
-
-    # --- Строка с источником ---
-    if source_ok:
-        source_url_line = f"🔗 {src_url}"
-    else:
-        source_url_line = ""
-
-    content = TEMPLATES["analytics"].format(
-        content=data["content"],
-        insight=data["insight"],
-        source=data.get("source", "—"),
-        source_url_line=source_url_line,
-        industry_tag=_industry_tag(data.get("industry", "")),
-    )
-
-    logger.debug(
-        f"Выбрана аналитика: {data.get('industry', '—')} "
-        f"({data.get('source', '—')}), "
-        f"ссылка {'есть' if source_ok else 'отсутствует'}"
-    )
-
-    return {
-        "title": "Аналитика рынка",
-        "content": content,
-        "source_url": src_url,
-    }
-# ================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ================================================================
 
-def generate_post() -> Dict:
-    post_type = random.choices(
-        ["news", "case", "analytics"],
-        weights=[0.5, 0.3, 0.2],
-        k=1,
-    )[0]
+def generate_post() -> Optional[Dict]:
+    """
+    Возвращает готовый пост (новость) или None, если ничего не подошло.
+    """
+    logger.info("Собираю свежие новости...")
+    news = fetch_rss_news(limit_per_source=30)
 
-    logger.info(f"Выбран тип поста: {post_type}")
+    if not news:
+        logger.warning("Нет новостей, прошедших фильтры. Публикация отменена.")
+        return None
 
-    if post_type == "news":
-        news = fetch_rss_news(limit_per_source=10)
+    logger.info(f"Доступно новостей: {len(news)}")
 
-        if not news:
-            logger.warning(
-                "Нет новостей за текущий период — переключаюсь на аналитику"
-            )
-            return generate_analytics_post()
-
-        prioritized = [n for n in news if n.get("inn") or n.get("company")]
-
-        if prioritized:
-            logger.info(
-                f"Новостей с ИНН/компанией: {len(prioritized)} "
-                f"из {len(news)} — выбираю из приоритетных"
-            )
-            pool = prioritized
-        else:
-            logger.info(
-                f"Новостей с деталями не найдено, "
-                f"выбираю из общего пула ({len(news)})"
-            )
-            pool = news
-
-        for item in random.sample(pool, min(5, len(pool))):
-            logger.debug(
-                f"Пробую новость: «{item['title'][:60]}» "
-                f"({item['published_date']})"
-            )
-            post = generate_news_post_with_ai(item)
-            if post:
-                logger.info(
-                    f"Пост сгенерирован из новости: «{item['title'][:60]}»"
-                )
-                return post
-            logger.debug("GigaChat не справился, пробую следующую")
-
-        logger.warning(
-            "Все попытки генерации новостей провалились — "
-            "переключаюсь на аналитику"
+    sample_size = min(25, len(news))
+    for item in random.sample(news, sample_size):
+        logger.debug(
+            f"Пробую: «{item['title'][:60]}» ({item['published_date']})"
         )
-        return generate_analytics_post()
-
-    if post_type == "case":
-        post = generate_case_post()
+        post = generate_news_post_with_ai(item)
         if post:
-            logger.info("Пост-кейс сгенерирован успешно")
+            logger.info(f"Пост сгенерирован: «{item['title'][:60]}»")
             return post
-        logger.warning("Нет актуальных кейсов — переключаюсь на аналитику")
-        return generate_analytics_post()
+        logger.debug("GigaChat вернул SKIP или ошибку, пробую следующую")
 
-    logger.info("Пост-аналитика сгенерирован")
-    return generate_analytics_post()
+    logger.warning("Все попытки генерации провалились — публикация отменена")
+    return None

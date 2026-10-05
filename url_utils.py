@@ -5,10 +5,12 @@
 - делает относительные URL абсолютными;
 - кодирует кириллицу и спецсимволы;
 - убирает UTM-метки;
-- проверяет доступность URL.
+- проверяет доступность URL (с кэшированием).
 """
-from urllib.parse import urlparse, urlunparse, quote, urljoin, parse_qsl, urlencode
 import logging
+import time
+from urllib.parse import urlparse, urlunparse, quote, urljoin, parse_qsl, urlencode
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,11 @@ REDIRECT_HOSTS = {
     "feeds.feedburner.com",
     "rss.app",
     "feed43.com",
+    "rsshub.app",
+    "feedly.com",
+    "inoreader.com",
+    "news.google.com",
+    "zen.yandex.ru",
 }
 
 # Трекинговые параметры
@@ -26,6 +33,17 @@ TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "yclid", "_openstat", "from", "ref",
 }
+
+# Домены-заглушки
+FAKE_DOMAINS = {
+    "пример-пресс-релиза.ru",
+    "example.com",
+    "test.ru",
+}
+
+# Кэш проверки ссылок: {url: (is_alive, timestamp)}
+_VALIDATE_CACHE = {}
+_CACHE_TTL = 3600  # 1 час
 
 
 def _strip_tracking(url: str) -> str:
@@ -64,9 +82,19 @@ def _make_absolute(url: str, source_url: str) -> str:
 
 def resolve_url(url: str, source_url: str = "", timeout: int = 8) -> str:
     """
-    Полный цикл нормализации URL.
+    Полный цикл нормализации URL:
+    1. Абсолютный ли путь.
+    2. Разворот редиректов (для известных агрегаторов).
+    3. Очистка трекинговых параметров.
+    4. Кодирование кириллицы.
     """
     if not url:
+        return ""
+
+    # Отсекаем заглушки
+    parsed = urlparse(url)
+    if parsed.netloc.lower() in FAKE_DOMAINS:
+        logger.warning(f"Отброшена ссылка-заглушка: {url}")
         return ""
 
     url = _make_absolute(url, source_url)
@@ -90,7 +118,7 @@ def resolve_url(url: str, source_url: str = "", timeout: int = 8) -> str:
 
 
 def is_url_alive(url: str, timeout: int = 5) -> bool:
-    """Проверяет, что URL доступен."""
+    """Проверяет доступность URL без кэширования."""
     if not url:
         return False
     try:
@@ -104,22 +132,47 @@ def is_url_alive(url: str, timeout: int = 5) -> bool:
         logger.warning(f"URL недоступен {url}: {e}")
         return False
 
+
 def validate_source_url(url: str, timeout: int = 5) -> bool:
     """
-    Проверяет, что URL реально открывается (HTTP 200).
-    Возвращает True, если страница доступна.
+    Проверяет, что URL-источник реально открывается (HTTP 200).
+    Отсекает заглушки и битые ссылки.
+    Результат кэшируется на _CACHE_TTL секунд.
     """
-    if not url or "пример-пресс-релиза" in url:
+    if not url:
         return False
+
+    parsed = urlparse(url)
+    if parsed.netloc.lower() in FAKE_DOMAINS:
+        logger.warning(f"Заглушка вместо ссылки: {url}")
+        return False
+
+    # Проверка кэша
+    now = time.time()
+    cached = _VALIDATE_CACHE.get(url)
+    if cached and (now - cached[1]) < _CACHE_TTL:
+        return cached[0]
+
     try:
         resp = requests.head(
             url, allow_redirects=True, timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0"}
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        if resp.status_code >= 400:
+        # Некоторые сайты не поддерживают HEAD — повторяем GET
+        if resp.status_code == 405:
+            resp = requests.get(
+                url, allow_redirects=True, timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0"},
+                stream=True,
+            )
+
+        ok = resp.status_code < 400
+        if not ok:
             logger.warning(f"Источник недоступен [{resp.status_code}]: {url}")
-            return False
-        return True
+
+        _VALIDATE_CACHE[url] = (ok, now)
+        return ok
     except Exception as e:
         logger.warning(f"Ошибка проверки ссылки {url}: {e}")
+        _VALIDATE_CACHE[url] = (False, now)
         return False

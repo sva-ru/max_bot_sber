@@ -17,6 +17,12 @@ async def publish_post(force: bool = False) -> bool:
 
     post = generate_post()
 
+    # Если нет подходящих новостей — не публикуем
+    if post is None:
+        logger.info("Нет свежих новостей для публикации — пропуск цикла")
+        return False
+
+    # Защита от дублей по URL
     if post.get("source_url") and not force:
         if is_url_published(post["source_url"]):
             logger.info(f"Пост уже публиковался: {post['source_url']}")
@@ -29,12 +35,14 @@ async def publish_post(force: bool = False) -> bool:
             parse_mode="markdown",
         )
         logger.info(f"Пост опубликован: {post['title']}")
+
         message_id = getattr(message, "message_id", "")
         save_post(
             title=post["title"],
             content=post["content"],
             source_url=post.get("source_url", ""),
             message_id=str(message_id),
+            ai_generated=post.get("ai_generated", False),
         )
         return True
     except Exception as e:
