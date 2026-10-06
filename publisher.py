@@ -15,7 +15,7 @@ async def publish_post(force: bool = False) -> bool:
         logger.error("CHANNEL_CHAT_ID не задан в .env")
         return False
 
-    post = generate_post()
+    post = await generate_post()
 
     # Если нет подходящих новостей — не публикуем
     if post is None:
