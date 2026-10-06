@@ -2,30 +2,26 @@
 """
 Настройка логирования проекта.
 
-Основной лог       → stdout + logs/channel.log (INFO+)
-Лог отбраковки RSS → logs/rss_rejected.log (DEBUG, только отброшенные)
+Все логи идут ТОЛЬКО в stdout (консоль / логи платформы).
+Файлового логирования нет — это упрощает работу в контейнерах
+и убирает проблемы с правами на запись в /app/logs и /data.
 """
 import logging
 import sys
-from pathlib import Path
-
-# logging_config.py
-BASE_DIR = Path(__file__).parent
-# Логи пишем в /data, где смонтирован постоянный том с правами UID 1000
-LOG_DIR = Path("/data/logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-MAIN_LOG = LOG_DIR / "channel.log"
-REJECTED_LOG = LOG_DIR / "rss_rejected.log"
 
 
 def setup_logging(debug: bool = False) -> None:
+    """
+    Настраивает корневой логгер: вывод только в stdout.
+
+    :param debug: если True — уровень DEBUG, иначе INFO.
+    """
     root_level = logging.DEBUG if debug else logging.INFO
 
-    # --- Основной логгер ---
     root = logging.getLogger()
     root.setLevel(root_level)
 
+    # Убираем старые обработчики (важно при повторных вызовах)
     for h in list(root.handlers):
         root.removeHandler(h)
 
@@ -38,25 +34,6 @@ def setup_logging(debug: bool = False) -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    main_file = logging.FileHandler(MAIN_LOG, mode="a", encoding="utf-8")
-    main_file.setLevel(root_level)
-    main_file.setFormatter(formatter)
-    root.addHandler(main_file)
-
-    # --- Отдельный логгер отбраковки RSS ---
-    rejected = logging.getLogger("rss_rejected")
-    rejected.setLevel(logging.DEBUG)
-    rejected.propagate = False
-
-    for h in list(rejected.handlers):
-        rejected.removeHandler(h)
-
-    rejected_file = logging.FileHandler(REJECTED_LOG, mode="w", encoding="utf-8")
-    rejected_file.setLevel(logging.DEBUG)
-    rejected_file.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-    rejected.addHandler(rejected_file)
-
     logging.getLogger(__name__).info(
-        f"Логирование настроено. Основной лог: {MAIN_LOG.name}, "
-        f"отбраковка RSS: {REJECTED_LOG.name}"
+        "Логирование настроено (только stdout, файловые логи отключены)."
     )

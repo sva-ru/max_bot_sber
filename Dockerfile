@@ -1,3 +1,4 @@
+# Dockerfile
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -24,13 +25,7 @@ RUN curl -k "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt" \
 
 COPY . .
 
-# Создаём пользователя с UID 1000 и даём права на директории
-RUN groupadd --gid 1000 appuser \
-    && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home appuser \
-    && mkdir -p /app/logs /data \
-    && chown -R 1000:1000 /app /data
-
-# Переключаемся на этого пользователя
-USER 1000
+# Папка для базы данных (для монтирования Volume в Cloud.ru)
+RUN mkdir -p /data
 
 CMD ["python", "main.py"]

@@ -1,14 +1,6 @@
 # Секреты
 .env
-
-# Логи
-*.log
-channel.log
-rss_rejected.log
-
-# База данных
-*.db
-channel_posts.db
+.env.*
 
 # Python
 __pycache__/
@@ -17,8 +9,16 @@ __pycache__/
 venv/
 env/
 
+# База данных SQLite (локально)
+*.db
+channel_posts.db
+
 # IDE
 .idea/
 .vscode/
 *.swp
 .DS_Store
+
+# Локальные логи (на всякий случай, если кто-то запускает старую версию)
+*.log
+logs/
