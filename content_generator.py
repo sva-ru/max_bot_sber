@@ -13,7 +13,11 @@
 5. Белый список — бизнес-лексика (для нетрастевых источников).
 6. GigaChat: если модель вернула blacklist или фразу-заглушку —
    новость пропускается, бот пробует следующую.
+
+feedparser.parse вызывается асинхронно через asyncio.to_thread,
+чтобы не блокировать event loop (важно для health-сервера).
 """
+import asyncio
 import html as html_module
 import logging
 import random
@@ -139,7 +143,6 @@ REFUSAL_PHRASES = [
 
 
 def _is_refusal(text: str) -> bool:
-    """Проверяет, является ли ответ модели отказом-заглушкой."""
     if not text:
         return True
     text_lower = text.lower()
@@ -168,7 +171,7 @@ BLACKLIST_KEYWORDS = [
     "матч", "турнир", "полуфинал", "четвертьфинал", "чемпионат", "кубок",
     "зенит", "спартак", "цска", "динамо", "краснодар сыграл",
 
-    # --- Шоу-бизнес и развлечения ---
+    # --- Шоу-бизнес ---
     "шоу-бизнес", "селебрити", "актер", "актрис", "актёр",
     "фильм вышел", "премьера фильма", "сериал", "концерт", "евровидение",
     "мисс вселенная", "блогер", "тиктокер", "инфлюенсер",
@@ -206,46 +209,34 @@ BLACKLIST_KEYWORDS = [
 ]
 
 REGIONAL_ANCHORS = [
-    # --- ЮФО ---
     "краснодар", "кубан", "сочи", "новороссийск", "анап",
     "армавир", "геленджик", "туапсе",
     "ростов", "таганрог", "шахты", "новочеркасск", "волгодонск",
     "ставропол", "пятигорск", "кисловодск", "ессентуки", "георгиевск",
     "адыге", "майкоп", "калмык", "элист",
-
-    # --- Крым ---
     "крым", "симферопол", "севастопол", "ялта", "керч", "феодоси",
     "евпатори", "саки", "судак",
-
-    # --- СКФО ---
     "дагестан", "махачкал", "дербент", "каспийск",
     "чечн", "грозн",
     "кабард", "балкар", "нальчик",
     "осети", "владикавказ", "беслан",
     "ингушет", "магас", "назран",
     "карачаев", "черкесск",
-
-    # --- Обобщённые ---
     "северный кавказ", "северо-кавказск",
     "юг россии", "южный федеральный", "юфо", "скфо",
     "юго-западн", "юзб", "юго-западный банк",
 ]
 
 WHITELIST_KEYWORDS = [
-    # --- Бизнес ---
     "компани", "корпораци", "фирм", "предприят", "стартап", "предпринимател",
     "ооо ", "ао ", "пао ", "зао ", "бизнес", "мсп ", "малому и среднему",
     "крупному бизнесу",
-
-    # --- Финансы ---
     "инвестор", "инвестиц", "инвестпроект", "кредит", "заем", "заём",
     "финансировани", "банк", "сбер", "втб", "газпромбанк", "альфа-банк",
     "сделк", "контракт", "соглашени", "договор",
     "млрд", "млн", "миллиард", "миллион", "тыс. руб",
     "выручк", "прибыл", "оборот", "капитал", "налог", "субсиди",
     "льготн", "ставк", "акци", "облигац", "бирж",
-
-    # --- Отрасли ---
     "апк", "агро", "сельхоз", "сельское хозяйство", "зерн", "молок",
     "птицевод", "тепличн", "машиностро", "металлург", "металлообработк",
     "станкостро", "туризм", "курорт", "гостин", "отел", "санатор",
@@ -263,12 +254,8 @@ WHITELIST_KEYWORDS = [
     "модернизац", "реконструкц", "капремонт",
     "франшиз", "маркетплейс",
     "газпром", "роснефт", "лукойл", "роснано", "ростех",
-
-    # --- Технологии ---
     "цифровизац", "it-", "ит-", "технологи", "инновац",
     "искусственный интеллект", "ии ",
-
-    # --- Господдержка ---
     "господдержк", "нацпроект", "национальн проект", "гчп", "концесси",
     "особая экономическая зона", "тосэр", "резидент", "меры поддержки",
 ]
@@ -298,20 +285,16 @@ def is_relevant_news(text: str, source_url: str = "") -> Tuple[bool, str]:
 
     text_lower = text.lower()
 
-    # 1. Чёрный список
     hit = _find_keyword(text_lower, BLACKLIST_KEYWORDS)
     if hit:
         return False, f"blacklist:{hit}"
 
-    # 2. Доверенные источники — пропускаем
     if _hostname(source_url) in TRUSTED_HOSTS:
         return True, "trusted"
 
-    # 3. Региональная привязка
     if not has_regional_anchor(text_lower):
         return False, "no-region"
 
-    # 4. Белый список
     hit = _find_keyword(text_lower, WHITELIST_KEYWORDS)
     if hit:
         return True, f"whitelist:{hit}"
@@ -409,10 +392,32 @@ TEMPLATES = {
 
 
 # ================================================================
+# АСИНХРОННЫЙ ПАРСИНГ ОДНОЙ ЛЕНТЫ
+# ================================================================
+
+async def _parse_feed_async(url: str):
+    """
+    Асинхронно парсит RSS-ленту.
+    feedparser.parse — синхронный, поэтому запускаем его
+    в отдельном потоке через asyncio.to_thread, чтобы не блокировать
+    event loop (важно для health-сервера Cloud.ru).
+    """
+    try:
+        return await asyncio.to_thread(feedparser.parse, url)
+    except Exception as e:
+        logger.warning(f"Ошибка парсинга RSS {url}: {e}")
+        return None
+
+
+# ================================================================
 # СБОР RSS
 # ================================================================
 
-def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
+async def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
+    """
+    Асинхронно собирает RSS-новости с фильтрацией.
+    Каждая лента парсится в отдельном потоке, event loop не блокируется.
+    """
     news_items: List[Dict] = []
     today = date.today()
     q = current_quarter(today)
@@ -445,7 +450,11 @@ def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
 
     for url in RSS_SOURCES:
         try:
-            feed = feedparser.parse(url)
+            feed = await _parse_feed_async(url)
+            if feed is None:
+                rejected.info(f"[{url}] ОШИБКА ПАРСИНГА")
+                continue
+
             src_total = len(feed.entries)
             src_accepted = 0
             src_wrong_year = 0
@@ -471,14 +480,12 @@ def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
                 raw_link = entry.get("link", "")
                 title = raw_title[:80]
 
-                # --- Заголовок ---
                 if not is_meaningful_title(raw_title):
                     stats["bad_title"] += 1
                     src_bad_title += 1
                     rejected.info(f"  [BAD_TITLE] «{raw_title}»")
                     continue
 
-                # --- Дата ---
                 if entry_date is None:
                     stats["no_date"] += 1
                     src_no_date += 1
@@ -505,7 +512,6 @@ def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
                     )
                     continue
 
-                # --- Релевантность ---
                 full_text = f"{title} {raw_summary}"
                 is_rel, reason = is_relevant_news(full_text, source_url=url)
                 if not is_rel:
@@ -519,7 +525,6 @@ def fetch_rss_news(limit_per_source: int = 30) -> List[Dict]:
                     rejected.info(f"  [IRRELEVANT {reason}] «{title}»")
                     continue
 
-                # --- Принято ---
                 stats["accepted"] += 1
                 src_accepted += 1
 
@@ -632,7 +637,7 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
     Генерирует пост через GigaChat.
     Пропускает новость, если:
       - GigaChat вернул пустой ответ;
-      - finish_reason == 'blacklist' (тематическое ограничение);
+      - finish_reason == 'blacklist';
       - в ответе есть фраза-заглушка;
       - модель вернула SKIP.
     """
@@ -695,7 +700,6 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
 
     generated, finish_reason = generate_text_safe(prompt, retries=2)
 
-    # --- Проверка 1: пустой ответ ---
     if not generated:
         logger.info(
             f"GigaChat вернул пустой ответ (reason={finish_reason}) "
@@ -703,7 +707,6 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
         )
         return None
 
-    # --- Проверка 2: тематический фильтр GigaChat ---
     if finish_reason == "blacklist":
         logger.warning(
             f"GigaChat: тематическое ограничение (blacklist) "
@@ -711,7 +714,6 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
         )
         return None
 
-    # --- Проверка 3: фразы-заглушки ---
     if _is_refusal(generated):
         logger.warning(
             f"GigaChat вернул фразу-заглушку "
@@ -719,12 +721,10 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
         )
         return None
 
-    # --- Проверка 4: SKIP от модели ---
     if generated.strip().upper() == "SKIP":
         logger.info(f"GigaChat вернул SKIP: «{news_item['title'][:60]}»")
         return None
 
-    # --- Страховка от HTML в ответе ---
     generated = clean_html(generated)
 
     link = news_item.get("link", "")
@@ -773,12 +773,13 @@ def generate_news_post(news_item: Dict) -> Optional[Dict]:
 # ГЛАВНАЯ ФУНКЦИЯ
 # ================================================================
 
-def generate_post() -> Optional[Dict]:
+async def generate_post() -> Optional[Dict]:
     """
-    Возвращает готовый пост (новость) или None, если ничего не подошло.
+    Асинхронно возвращает готовый пост (новость)
+    или None, если ничего не подошло.
     """
     logger.info("Собираю свежие новости...")
-    news = fetch_rss_news(limit_per_source=30)
+    news = await fetch_rss_news(limit_per_source=30)
 
     if not news:
         logger.warning("Нет новостей, прошедших фильтры. Публикация отменена.")
@@ -791,7 +792,9 @@ def generate_post() -> Optional[Dict]:
         logger.debug(
             f"Пробую: «{item['title'][:60]}» ({item['published_date']})"
         )
-        post = generate_news_post_with_ai(item)
+        # generate_news_post_with_ai синхронный (GigaChat SDK)
+        # запускаем в отдельном потоке, чтобы не блокировать event loop
+        post = await asyncio.to_thread(generate_news_post_with_ai, item)
         if post:
             logger.info(f"Пост сгенерирован: «{item['title'][:60]}»")
             return post
