@@ -2,18 +2,19 @@
 """
 Асинхронный клиент GigaChat.
 
+Асинхронный клиент (GigaChatAsyncClient) в этой версии SDK
+работает со старой моделью Chat/Messages, а не ChatCompletionRequest.
+Это отличие от синхронного клиента GigaChat.
+
 Возвращает (текст, finish_reason), чтобы вызывающий код
 мог отличить нормальный ответ от отказа модели (blacklist).
-
-Все запросы — нативные async через GigaChatAsyncClient,
-с явным таймаутом, чтобы не блокировать event loop.
 """
 import asyncio
 import logging
 from typing import Tuple
 
 from gigachat import GigaChatAsyncClient
-from gigachat.models import ChatCompletionRequest, ChatMessage
+from gigachat.models import Chat, Messages, MessagesRole
 
 from config import GIGACHAT_CREDENTIALS, GIGACHAT_SCOPE, GIGACHAT_MODEL
 
@@ -33,7 +34,7 @@ def get_client() -> GigaChatAsyncClient:
             scope=GIGACHAT_SCOPE,
             model=GIGACHAT_MODEL,
             verify_ssl_certs=True,
-            timeout=30,  # общий таймаут на HTTP-запросы (сек)
+            timeout=30,
         )
         logger.info("Клиент GigaChat (async) успешно инициализирован.")
     return _client
@@ -63,23 +64,26 @@ async def generate_text(
     Возвращает кортеж (текст, finish_reason):
       - 'stop'      — нормальное завершение;
       - 'length'    — обрезано по max_tokens;
-      - 'blacklist' — сработал тематический фильтр (отказ модели);
+      - 'blacklist' — сработал тематический фильтр;
       - 'error'     — исключение при запросе.
     """
     client = get_client()
     try:
-        request = ChatCompletionRequest(
-            model=GIGACHAT_MODEL,
-            messages=[ChatMessage(role="user", content=prompt)],
+        # Async-клиент принимает модель Chat (не ChatCompletionRequest!)
+        chat = Chat(
+            messages=[
+                Messages(role=MessagesRole.USER, content=prompt)
+            ],
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        response = await client.achat(request)
+
+        response = await client.achat(chat)
 
         text = ""
         if getattr(response, "messages", None):
             try:
-                text = response.messages[0].content[0].text or ""
+                text = response.messages[0].content or ""
             except (IndexError, AttributeError, TypeError):
                 text = ""
 
@@ -119,6 +123,6 @@ async def generate_text_safe(prompt: str, retries: int = 2) -> Tuple[str, str]:
             logger.warning(f"Попытка {attempt + 1} не удалась: {e}")
 
         if attempt < retries - 1:
-            await asyncio.sleep(2)  # асинхронная пауза, не блокирует loop
+            await asyncio.sleep(2)
 
     return "", "error"
