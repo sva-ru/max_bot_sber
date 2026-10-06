@@ -9,9 +9,11 @@ import logging
 import sys
 from pathlib import Path
 
+# logging_config.py
 BASE_DIR = Path(__file__).parent
-LOG_DIR = BASE_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+# Логи пишем в /data, где смонтирован постоянный том с правами UID 1000
+LOG_DIR = Path("/data/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 MAIN_LOG = LOG_DIR / "channel.log"
 REJECTED_LOG = LOG_DIR / "rss_rejected.log"
