@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from logging_config import setup_logging
 from database import init_db
 from scheduler import setup_scheduler
@@ -17,22 +17,27 @@ from gigachat_client import close_client
 # ================================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-    """Отвечает 200 OK на любой GET. Никаких обращений к БД или API."""
-
     def do_GET(self):
+        logger = logging.getLogger("healthcheck")
+        logger.info(
+            f"PROBE IN: {self.command} {self.path} "
+            f"from {self.client_address[0]}"
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"OK")
 
-    def log_message(self, fmt, *args):
-        # Не засоряем основной лог health-запросами
-        pass
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
+    def log_message(self, fmt, *args):
+        pass
 
 def start_health_server(port: int) -> None:
     """Запускает HTTP health-сервер в daemon-потоке."""
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logging.getLogger(__name__).info(
