@@ -2,55 +2,70 @@
 import asyncio
 import logging
 import os
-
-from aiohttp import web
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from logging_config import setup_logging
 from database import init_db
 from scheduler import setup_scheduler
 from bot import dp, bot as bot_instance
+from gigachat_client import close_client
 
 
-# ---------- Health-сервер для Cloud.ru ----------
-async def _health(request):
-    return web.Response(text="OK", status=200)
+# ================================================================
+# HEALTH-СЕРВЕР (отдельный поток, не зависит от event loop)
+# ================================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Отвечает 200 OK на любой GET. Никаких обращений к БД или API."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, fmt, *args):
+        # Не засоряем основной лог health-запросами
+        pass
 
 
-async def start_health_server():
-    """
-    Поднимает HTTP-сервер на порту из $PORT (или 8080).
-    Отвечает 200 OK на любой GET — этого достаточно для liveness probe.
-    """
-    port = int(os.getenv("PORT", "8080"))
-    app = web.Application()
-    app.router.add_get("/", _health)
-    app.router.add_get("/health", _health)
-    app.router.add_get("/healthz", _health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.getLogger(__name__).info(f"Health-сервер запущен на порту {port}")
+def start_health_server(port: int) -> None:
+    """Запускает HTTP health-сервер в daemon-потоке."""
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.getLogger(__name__).info(
+        f"Health-сервер запущен на порту {port} (отдельный поток)"
+    )
 
 
-# ---------- main ----------
+# ================================================================
+# MAIN
+# ================================================================
+
 async def main():
     setup_logging(debug=False)
     logger = logging.getLogger(__name__)
 
+    # Health-сервер поднимаем как можно раньше,
+    # чтобы Cloud.ru успел получить первый ответ до readiness probe.
+    port = int(os.getenv("PORT", "8080"))
+    start_health_server(port)
+
     init_db()
     logger.info("База данных инициализирована.")
-
-    # Запускаем health-сервер параллельно с ботом
-    await start_health_server()
 
     scheduler = setup_scheduler()
     scheduler.start()
     logger.info("Планировщик запущен.")
 
     logger.info("Запуск бота...")
-    await dp.start_polling(bot_instance)
+    try:
+        await dp.start_polling(bot_instance)
+    finally:
+        # Закрываем клиент GigaChat при остановке
+        await close_client()
 
 
 if __name__ == "__main__":

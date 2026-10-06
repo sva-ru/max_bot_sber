@@ -25,7 +25,6 @@ import re
 from datetime import date, datetime
 from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse
-
 import feedparser
 
 from gigachat_client import generate_text_safe
@@ -632,9 +631,9 @@ def _ensure_source_link(text: str, source_url: str) -> str:
 # НОВОСТЬ → ПОСТ
 # ================================================================
 
-def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
+async def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
     """
-    Генерирует пост через GigaChat.
+    Асинхронно генерирует пост через GigaChat.
     Пропускает новость, если:
       - GigaChat вернул пустой ответ;
       - finish_reason == 'blacklist';
@@ -698,7 +697,7 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
 Выведи только готовый текст поста или одно слово SKIP.
 """
 
-    generated, finish_reason = generate_text_safe(prompt, retries=2)
+    generated, finish_reason = await generate_text_safe(prompt, retries=2)
 
     if not generated:
         logger.info(
@@ -736,7 +735,6 @@ def generate_news_post_with_ai(news_item: Dict) -> Optional[Dict]:
         "source_url": link,
         "ai_generated": True,
     }
-
 
 def generate_news_post(news_item: Dict) -> Optional[Dict]:
     """Фолбэк без GigaChat."""
@@ -792,9 +790,7 @@ async def generate_post() -> Optional[Dict]:
         logger.debug(
             f"Пробую: «{item['title'][:60]}» ({item['published_date']})"
         )
-        # generate_news_post_with_ai синхронный (GigaChat SDK)
-        # запускаем в отдельном потоке, чтобы не блокировать event loop
-        post = await asyncio.to_thread(generate_news_post_with_ai, item)
+        post = await generate_news_post_with_ai(item)
         if post:
             logger.info(f"Пост сгенерирован: «{item['title'][:60]}»")
             return post

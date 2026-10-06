@@ -1,47 +1,64 @@
 # gigachat_client.py
 """
-Клиент GigaChat.
+Асинхронный клиент GigaChat.
 
-Возвращает не только текст, но и finish_reason, чтобы вызывающий код
+Возвращает (текст, finish_reason), чтобы вызывающий код
 мог отличить нормальный ответ от отказа модели (blacklist).
+
+Все запросы — нативные async через GigaChatAsyncClient,
+с явным таймаутом, чтобы не блокировать event loop.
 """
+import asyncio
 import logging
-import time
 from typing import Tuple
 
-from gigachat import GigaChat
+from gigachat import GigaChatAsyncClient
 from gigachat.models import ChatCompletionRequest, ChatMessage
 
 from config import GIGACHAT_CREDENTIALS, GIGACHAT_SCOPE, GIGACHAT_MODEL
 
 logger = logging.getLogger(__name__)
 
-_client = None
+_client: GigaChatAsyncClient | None = None
 
 
-def get_client() -> GigaChat:
-    """Ленивая инициализация клиента GigaChat."""
+def get_client() -> GigaChatAsyncClient:
+    """Ленивая инициализация асинхронного клиента GigaChat."""
     global _client
     if _client is None:
         if not GIGACHAT_CREDENTIALS:
             raise ValueError("GIGACHAT_CREDENTIALS не задан в .env")
-        _client = GigaChat(
+        _client = GigaChatAsyncClient(
             credentials=GIGACHAT_CREDENTIALS,
             scope=GIGACHAT_SCOPE,
             model=GIGACHAT_MODEL,
             verify_ssl_certs=True,
+            timeout=30,  # общий таймаут на HTTP-запросы (сек)
         )
-        logger.info("Клиент GigaChat успешно инициализирован.")
+        logger.info("Клиент GigaChat (async) успешно инициализирован.")
     return _client
 
 
-def generate_text(
+async def close_client() -> None:
+    """Закрывает HTTP-соединения при остановке бота."""
+    global _client
+    if _client is not None:
+        try:
+            await _client.aclose()
+            logger.info("Клиент GigaChat закрыт.")
+        except Exception as e:
+            logger.warning(f"Ошибка при закрытии клиента GigaChat: {e}")
+        finally:
+            _client = None
+
+
+async def generate_text(
     prompt: str,
     temperature: float = 0.7,
     max_tokens: int = 1800,
 ) -> Tuple[str, str]:
     """
-    Отправляет промпт в GigaChat.
+    Отправляет промпт в GigaChat асинхронно.
 
     Возвращает кортеж (текст, finish_reason):
       - 'stop'      — нормальное завершение;
@@ -57,7 +74,7 @@ def generate_text(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        response = client.chat.create(request)
+        response = await client.achat(request)
 
         text = ""
         if getattr(response, "messages", None):
@@ -75,20 +92,18 @@ def generate_text(
 
         return text.strip(), finish_reason
     except Exception as e:
-        logger.error(f"Ошибка генерации GigaChat: {e}")
+        logger.error(f"Ошибка генерации GigaChat: {type(e).__name__}: {e}")
         return "", "error"
 
 
-def generate_text_safe(prompt: str, retries: int = 2) -> Tuple[str, str]:
+async def generate_text_safe(prompt: str, retries: int = 2) -> Tuple[str, str]:
     """
-    Обёртка над generate_text с повторными попытками.
-
+    Обёртка с повторными попытками.
     При blacklist повторять бессмысленно — сразу возвращаем наверх.
-    При прочих ошибках пробуем retries раз с паузой.
     """
     for attempt in range(retries):
         try:
-            text, reason = generate_text(prompt)
+            text, reason = await generate_text(prompt)
 
             if reason == "blacklist":
                 logger.warning(
@@ -104,6 +119,6 @@ def generate_text_safe(prompt: str, retries: int = 2) -> Tuple[str, str]:
             logger.warning(f"Попытка {attempt + 1} не удалась: {e}")
 
         if attempt < retries - 1:
-            time.sleep(2)
+            await asyncio.sleep(2)  # асинхронная пауза, не блокирует loop
 
     return "", "error"
